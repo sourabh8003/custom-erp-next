@@ -2,7 +2,7 @@ version: "3"
 
 services:
   backend:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -11,6 +11,7 @@ services:
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
+      # - /d/docker-backups:/home/frappe/backups #Add this while restoring site
     environment:
       DB_HOST: db
       DB_PORT: "3306"
@@ -18,7 +19,7 @@ services:
       MARIADB_ROOT_PASSWORD: admin
 
   configurator:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -47,7 +48,7 @@ services:
       - logs:/home/frappe/frappe-bench/logs
 
   create-site:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -77,7 +78,7 @@ services:
           fi
         done;
         echo "sites/common_site_config.json found";
-        bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --install-app india_compliance --set-default frontend;
+        bench new-site --db-name=erpnext_db_1 --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --install-app india_compliance --set-default frontend;
 
   db:
     image: mariadb:10.6
@@ -98,11 +99,13 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: admin
       MARIADB_ROOT_PASSWORD: admin
+    ports:
+      - "3306:3306"
     volumes:
-      - db-data:/var/lib/mysql
+      - /d/docker-data/mariadb:/var/lib/mysql
 
   frontend:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     depends_on:
@@ -128,7 +131,7 @@ services:
       - "8080:8080"
 
   queue-long:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -144,7 +147,7 @@ services:
       - logs:/home/frappe/frappe-bench/logs
 
   queue-short:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -178,7 +181,7 @@ services:
         condition: on-failure
 
   scheduler:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -192,7 +195,7 @@ services:
       - logs:/home/frappe/frappe-bench/logs
 
   websocket:
-    image: frappe-ssingh
+    image: frappe-ssingh-v1
     networks:
       - frappe_network
     deploy:
@@ -205,8 +208,83 @@ services:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
+  backup:
+    image: frappe-ssingh-v1
+    networks:
+      - frappe_network
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - /d/docker-backups:/home/frappe/backups
+    environment:
+      - BACKUP_RETENTION_COUNT=15
+      - BACKUP_INTERVAL=300  # 24 hours
+    command: >
+      bash -c '
+        BACKUP_ROOT="/home/frappe/backups"
+        BENCH_PATH="/home/frappe/frappe-bench"
+        LOG_FILE="$$BACKUP_ROOT/backup.log"
+        BACKUP_INTERVAL="${BACKUP_INTERVAL:-300}"
+        RETENTION_COUNT="${BACKUP_RETENTION_COUNT:-15}"
+
+        mkdir -p "$$BACKUP_ROOT"
+        cd "$$BENCH_PATH"
+
+        echo "[$$(date)] Backup service started - Interval: $$BACKUP_INTERVAL sec, Retention: $$RETENTION_COUNT" | tee -a "$$LOG_FILE"
+
+        while true; do
+          # Rotate log if > 5MB
+          if [ -f "$$LOG_FILE" ] && [ "$$(stat -c%s "$$LOG_FILE")" -gt 5242880 ]; then
+            mv "$$LOG_FILE" "$$LOG_FILE.old"
+            touch "$$LOG_FILE"
+          fi
+
+          echo "[$$(date)] Starting backup..." | tee -a "$$LOG_FILE"
+          TIMESTAMP=$$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "backup_$$$$")
+          BACKUP_DIR="$$BACKUP_ROOT/backup_$$TIMESTAMP"
+          mkdir -p "$$BACKUP_DIR"
+
+          # Backup all sites with files
+          if bench --site all backup --with-files --backup-path "$$BACKUP_DIR" >> "$$LOG_FILE" 2>&1; then
+            echo "[$$(date)] ✓ Database + file backup successful" | tee -a "$$LOG_FILE"
+          else
+            echo "[$$(date)] ✗ Backup command failed" | tee -a "$$LOG_FILE"
+          fi
+
+          # Backup codebase (custom apps + config)
+          tar -czf "$$BACKUP_DIR/codebase.tar.gz" -C /home/frappe frappe-bench/apps frappe-bench/config >> "$$LOG_FILE" 2>&1
+
+          # Verify existence of DB dump(s)
+          if ls "$$BACKUP_DIR"/*.sql.gz >/dev/null 2>&1; then
+            echo "[$$(date)] ✓ Backup verified" | tee -a "$$LOG_FILE"
+            touch "$$BACKUP_DIR/.success"
+            echo "[$$(date)] Last successful backup: $$TIMESTAMP" > "$$BACKUP_ROOT/last_success.txt"
+          else
+            echo "[$$(date)] ✗ Backup verification failed — no .sql.gz found" | tee -a "$$LOG_FILE"
+            touch "$$BACKUP_DIR/.failed"
+          fi
+
+          # Optional: Create a compressed tar.gz of the whole backup folder
+          # Uncomment the lines below to enable it
+          # tar -czf "$$BACKUP_ROOT/backup_$$TIMESTAMP.tar.gz" -C "$$BACKUP_ROOT" "backup_$$TIMESTAMP"
+          # rm -rf "$$BACKUP_DIR"
+
+          # Delete old backups if count exceeds retention
+          BACKUP_COUNT=$$(ls -1d "$$BACKUP_ROOT"/backup_* 2>/dev/null | wc -l)
+          if [ "$$BACKUP_COUNT" -gt "$$RETENTION_COUNT" ]; then
+            DELETE_COUNT=$$((BACKUP_COUNT - RETENTION_COUNT))
+            echo "[$$(date)] Removing $$DELETE_COUNT old backups..." | tee -a "$$LOG_FILE"
+            ls -1dt "$$BACKUP_ROOT"/backup_* 2>/dev/null | tail -n "$$DELETE_COUNT" | xargs rm -rf
+          fi
+
+          echo "[$$(date)] Next backup in $$BACKUP_INTERVAL seconds" | tee -a "$$LOG_FILE"
+          echo "" >> "$$LOG_FILE"
+
+          sleep "$$BACKUP_INTERVAL"
+        done
+      '
+
+  
 volumes:
-  db-data:
   redis-queue-data:
   sites:
   logs:
