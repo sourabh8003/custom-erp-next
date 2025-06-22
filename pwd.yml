@@ -268,12 +268,15 @@ services:
           # tar -czf "$$BACKUP_ROOT/backup_$$TIMESTAMP.tar.gz" -C "$$BACKUP_ROOT" "backup_$$TIMESTAMP"
           # rm -rf "$$BACKUP_DIR"
 
-          # Delete old backups if count exceeds retention
-          BACKUP_COUNT=$$(ls -1d "$$BACKUP_ROOT"/backup_* 2>/dev/null | wc -l)
-          if [ "$$BACKUP_COUNT" -gt "$$RETENTION_COUNT" ]; then
-            DELETE_COUNT=$$((BACKUP_COUNT - RETENTION_COUNT))
-            echo "[$$(date)] Removing $$DELETE_COUNT old backups..." | tee -a "$$LOG_FILE"
-            ls -1dt "$$BACKUP_ROOT"/backup_* 2>/dev/null | tail -n "$$DELETE_COUNT" | xargs rm -rf
+          # Delete old successful backups if count exceeds retention
+          # Only count and manage successful backups (those with .success file)
+          SUCCESSFUL_BACKUPS=$$(find "$$BACKUP_ROOT" -name "backup_*" -type d -exec test -f "{}/.success" \; -print 2>/dev/null | wc -l)
+          if [ "$$SUCCESSFUL_BACKUPS" -gt "$$RETENTION_COUNT" ]; then
+            DELETE_COUNT=$$((SUCCESSFUL_BACKUPS - RETENTION_COUNT))
+            echo "[$$(date)] Found $$SUCCESSFUL_BACKUPS successful backups, removing $$DELETE_COUNT oldest ones..." | tee -a "$$LOG_FILE"
+            # Get successful backup directories sorted by modification time (oldest first)
+            find "$$BACKUP_ROOT" -name "backup_*" -type d -exec test -f "{}/.success" \; -print 2>/dev/null | \
+              xargs ls -1dt | tail -n "$$DELETE_COUNT" | xargs rm -rf
           fi
 
           echo "[$$(date)] Next backup in $$BACKUP_INTERVAL seconds" | tee -a "$$LOG_FILE"
